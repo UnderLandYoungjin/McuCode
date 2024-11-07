@@ -1,3 +1,166 @@
+#include <avr/io.h>
+#include <avr/interrupt.h>
+
+#define CLR 0
+#define SET 1
+#define TO_START 184
+
+int hundredths = 0;            // 0.01초 단위로 저장하는 변수 (초기값 0)
+int tmr0_cnt = 0;              // 타이머 0 카운트 변수
+int led_blink_cnt = 0;         // LED 깜빡임을 위한 카운트 변수 (0.1초마다 깜빡임)
+char tmr0_flag = CLR;          // 타이머 0 플래그 변수
+char timer_running = 0;        // 타이머 동작 여부 (0: 정지, 1: 동작)
+char prev_PE4_state = 1;       // 이전 PE4 핀 상태 저장 (1: HIGH, 0: LOW)
+char prev_PE5_state = 1;       // 이전 PE5 핀 상태 저장 (1: HIGH, 0: LOW)
+volatile int digit_cnt = 0;    // FND 자리 선택 카운트
+
+// 부저 제어 관련 변수
+volatile int buzzer_duration = 0; // 부저가 울리는 시간 카운트
+
+// FND 관련 배열 정의
+char digit_table[4] = {0x10, 0x20, 0x40, 0x80};  // DIG1~DIG4 자리 제어
+char fnd_table[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F}; // 0~9까지 세그먼트 패턴
+
+// TIMER0 오버플로우 인터럽트 루틴
+ISR(TIMER0_OVF_vect)
+{
+	TCNT0 = TO_START;          // 타이머 초기값 설정
+
+	if (++tmr0_cnt >= 2) {     // 0.01초마다 (2번 오버플로우 -> 0.01초)
+		tmr0_cnt = 0;          // 타이머 카운트 초기화
+		if (timer_running) {   // 타이머가 동작 중일 때만 증가
+			tmr0_flag = SET;   // 타이머 플래그 설정
+
+			// LED 깜빡임 주기 (0.1초마다 깜빡임)
+			if (++led_blink_cnt >= 10) { // 0.1초마다 (10 * 0.01초 = 0.1초)
+				PORTB ^= 0xFF;          // PORTB의 모든 핀을 토글 (PB0~PB7 깜빡임)
+				led_blink_cnt = 0;      // LED 깜빡임 카운트 초기화
+			}
+		}
+		
+		// 부저 동작 시간 확인
+		if (buzzer_duration > 0) {
+			buzzer_duration--;
+			if (buzzer_duration == 0) {
+				PORTG &= ~(1 << PG3); // 부저 끄기
+			}
+		}
+	}
+
+	// FND 디스플레이 업데이트 (멀티플렉싱)
+	PORTD &= ~0xF0; // 현재 자리 끄기
+	if (digit_cnt == 0) {
+		PORTC = ~fnd_table[(hundredths / 1000) % 10];  // 천의 자리
+		PORTD |= digit_table[0];
+		} else if (digit_cnt == 1) {
+		PORTC = ~fnd_table[(hundredths / 100) % 10];   // 백의 자리
+		PORTD |= digit_table[1];
+		} else if (digit_cnt == 2) {
+		PORTC = ~fnd_table[(hundredths / 10) % 10];    // 십의 자리
+		PORTD |= digit_table[2];
+		} else if (digit_cnt == 3) {
+		PORTC = ~fnd_table[hundredths % 10];           // 일의 자리
+		PORTD |= digit_table[3];
+	}
+
+	if (++digit_cnt >= 4) digit_cnt = 0;  // 4자리 반복
+}
+
+//-------- Delay 서브루틴 --------
+void Delay_us(char time_us) {
+	char i;
+	for (i = 0; i < time_us; i++) {
+		asm volatile(" PUSH R0");
+		asm volatile(" POP  R0");
+		asm volatile(" PUSH R0");
+		asm volatile(" POP  R0");
+		asm volatile(" PUSH R0");
+		asm volatile(" POP  R0");
+		asm volatile(" PUSH R0");
+		asm volatile(" POP  R0");
+	}
+}
+
+void Delay_ms(unsigned int time_ms) {
+	unsigned int i;
+	for (i = 0; i < time_ms; i++) {
+		Delay_us(250);
+		Delay_us(250);
+		Delay_us(250);
+		Delay_us(250);
+	}
+}
+
+//-------- LCD 관련 서브루틴 --------
+void lcd_write(char c) {
+	PORTA = c;
+	PORTG |= 0x04;
+	Delay_us(1);
+	PORTG &= ~0x04;
+	Delay_us(250);
+}
+
+void cursor_off(void) {
+	PORTG &= 0xFE;
+	Delay_ms(200);
+	lcd_write(0x0C);
+	Delay_ms(100);
+}
+
+void lcd_clear(void) {
+	PORTG &= 0xFE;
+	Delay_us(1);
+	lcd_write(0x01);
+	Delay_ms(4);
+}
+
+void lcd_init(void) {
+	PORTG &= 0xFE;
+	Delay_ms(200);
+	lcd_write(0x38);
+	lcd_write(0x0F);
+	lcd_write(0x01);
+	Delay_ms(100);
+}
+
+void lcd_gotoxy(unsigned char x, unsigned char y) {
+	PORTG &= 0xFE;
+	Delay_us(1);
+	if (y == 0) lcd_write(0x80 + x);
+	else lcd_write(0xC0 + x);
+	Delay_ms(1);
+}
+
+void lcd_puts(char *s) {
+	PORTG |= 0x01;
+	Delay_us(1);
+	while (*s) {
+		lcd_write(*s++);
+	}
+}
+
+void lcd_putch(char c) {
+	PORTG |= 0x01;
+	Delay_us(1);
+	PORTA = c;
+	PORTG |= 0x04;
+	Delay_us(1);
+	PORTG &= ~0x04;
+	Delay_us(250);
+}
+
+void display_time() {
+	// LCD에 0.01초 단위로 초를 [XX.XX] 형식으로 표시
+	lcd_gotoxy(9,1);                 // 표시 위치로 커서 이동
+	lcd_putch('[');                  // 괄호 시작
+	lcd_putch((hundredths / 1000) % 10 + '0'); // 초의 10의 자리 출력
+	lcd_putch((hundredths / 100) % 10 + '0');  // 초의 1의 자리 출력
+	lcd_putch('.');                             // 소수점 출력
+	lcd_putch((hundredths / 10) % 10 + '0');    // 소수점 첫째 자리 출력
+	lcd_putch(hundredths % 10 + '0');           // 소수점 둘째 자리 출력
+	lcd_putch(']');                  // 괄호 끝
+}
+
 void check_PE4_PE5(void) {
 	// PE4 스위치 상태 확인
 	if ((PINE & (1 << PE4)) == 0 && prev_PE4_state == 1) { // falling edge 감지
